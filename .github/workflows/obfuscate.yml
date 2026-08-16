@@ -32,12 +32,14 @@ jobs:
                   if file.endswith('.lua'):
                       in_path = os.path.join('input', file)
                       out_path = os.path.join('output', file)
-                      with open(in_path, 'r', encoding='utf-8') as f:
-                          code = f.read()
+                      
+                      with open(in_path, 'rb') as f:
+                          raw_bytes = f.read()
                       
                       key = random.randint(1, 255)
-                      encoded_bytes = [(ord(c) ^ key) for c in code]
-                      b64_str = base64.b64encode(bytes(encoded_bytes)).decode('utf-8')
+                      # 使用 UTF-8 字节流进行 XOR，完美支持中文与表情符号
+                      encoded_bytes = bytes([b ^ key for b in raw_bytes])
+                      b64_str = base64.b64encode(encoded_bytes).decode('utf-8')
                       
                       obfuscated = f'''-- Auto Obfuscated Script
           local _k = {key}
