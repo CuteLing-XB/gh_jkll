@@ -4,9 +4,10 @@ on:
   push:
     paths:
       - 'input/*.lua'
+  workflow_dispatch: # 支持在 Actions 页面手动点击运行
 
 permissions:
-  contents: write # 🌟 开启写入权限，防止 GitHub 拦截 Commit
+  contents: write
 
 jobs:
   obfuscate:
@@ -20,27 +21,28 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Clone Prometheus
+      # 1. 克隆最新版 Prometheus 并构建编译
+      - name: Clone and Build Prometheus
         run: |
           git clone --depth 1 https://github.com/prometheus-lua/Prometheus.git prometheus-tool
           cd prometheus-tool
           npm install
+          npm run build || true
+          npm link || npm install -g .
 
+      # 2. 调用编译好的 Prometheus CLI 执行混淆
       - name: Run Obfuscation
         run: |
           mkdir -p output
           for file in input/*.lua; do
             filename=$(basename "$file")
-            # 自动探测并兼容所有可能的 CLI 入口路径与参数格式
-            if [ -f "prometheus-tool/CLI.js" ]; then
-              node prometheus-tool/CLI.js "$file" -o "output/$filename"
-            elif [ -f "prometheus-tool/cli.js" ]; then
-              node prometheus-tool/cli.js --input "$file" --output "output/$filename"
-            else
-              node prometheus-tool/index.js --input "$file" --output "output/$filename"
-            fi
+            # 使用全局链接的 prometheus 命令或打包后的入口
+            npx prometheus "$file" --preset Pipeline -o "output/$filename" || \
+            node prometheus-tool/dist/cli.js "$file" -o "output/$filename" || \
+            node prometheus-tool/CLI.js "$file" -o "output/$filename"
           done
 
+      # 3. 提交加密后的脚本到 output 文件夹
       - name: Commit and Push
         run: |
           git config --global user.name "github-actions[bot]"
