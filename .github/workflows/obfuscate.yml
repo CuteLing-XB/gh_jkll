@@ -1,0 +1,45 @@
+name: Auto Obfuscate Lua
+
+on:
+  push:
+    paths:
+      - 'input/*.lua'
+
+jobs:
+  obfuscate:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 使用最新版拉取仓库代码
+      - name: Checkout repo code
+        uses: actions/checkout@v4
+
+      # 2. 配置最新的 LTS 版 Node.js 环境
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 3. 动态获取 Prometheus 官方最新仓库并安装依赖
+      - name: Clone Prometheus
+        run: |
+          git clone --depth 1 https://github.com/prometheus-lua/Prometheus.git prometheus-tool
+          cd prometheus-tool
+          npm install
+
+      # 4. 执行加密流程
+      - name: Run Obfuscation
+        run: |
+          mkdir -p output
+          for file in input/*.lua; do
+            filename=$(basename "$file")
+            node prometheus-tool/cli.js --input "$file" --output "output/$filename" || node prometheus-tool/index.js --input "$file" --output "output/$filename"
+          done
+
+      # 5. 将混淆后的结果提交并推送到 output 文件夹
+      - name: Commit and Push
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/
+          git commit -m "Auto-obfuscated via Prometheus" || exit 0
+          git push
