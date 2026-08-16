@@ -12,9 +12,6 @@ permissions:
 jobs:
   obfuscate:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true" # 🌟 开启 Node24 强制兼容
-      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
     steps:
       - name: Checkout repo code
         uses: actions/checkout@v4
@@ -24,24 +21,28 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Run Obfuscator
+      - name: Create Obfuscator Script
         run: |
-          mkdir -p output
-          python3 -c '
+          cat << 'EOF' > obfuscate.py
           import os, base64, random
 
-          for file in os.listdir("input"):
-              if file.endswith(".lua"):
-                  in_path = os.path.join("input", file)
-                  out_path = os.path.join("output", file)
-                  with open(in_path, "r", encoding="utf-8") as f:
-                      code = f.read()
-                  
-                  key = random.randint(1, 255)
-                  encoded_bytes = [(ord(c) ^ key) for c in code]
-                  b64_str = base64.b64encode(bytes(encoded_bytes)).decode("utf-8")
-                  
-                  obfuscated = f"""-- Auto Obfuscated Script
+          if not os.path.exists("output"):
+              os.makedirs("output")
+
+          if os.path.exists("input"):
+              for file in os.listdir("input"):
+                  if file.endswith(".lua"):
+                      in_path = os.path.join("input", file)
+                      out_path = os.path.join("output", file)
+                      
+                      with open(in_path, "r", encoding="utf-8") as f:
+                          code = f.read()
+                      
+                      key = random.randint(1, 255)
+                      encoded_bytes = [(ord(c) ^ key) for c in code]
+                      b64_str = base64.b64encode(bytes(encoded_bytes)).decode("utf-8")
+                      
+                      obfuscated = f'''-- Auto Obfuscated Script
           local _k = {key}
           local _b = "{b64_str}"
           local function _d(data, k)
@@ -60,10 +61,13 @@ jobs:
               end))
           end
           load(_d(_b, _k))()
-          """
-                  with open(out_path, "w", encoding="utf-8") as f:
-                      f.write(obfuscated)
-          '
+          '''
+                      with open(out_path, "w", encoding="utf-8") as f:
+                          f.write(obfuscated)
+          EOF
+
+      - name: Run Obfuscation
+        run: python3 obfuscate.py
 
       - name: Commit and Push
         run: |
