@@ -3,14 +3,13 @@ const express = require('express');
 const axios = require('axios');
 require('dotenv').config();
 
-// 从环境变量读取配置
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_OWNER = process.env.GITHUB_OWNER;
 const GITHUB_REPO = process.env.GITHUB_REPO;
 const GITHUB_PATH = process.env.GITHUB_PATH || 'keys.txt';
 const PORT = process.env.PORT || 3000;
-const AUTH_SECRET = process.env.AUTH_SECRET || "XiaoLin666"; // Lua 验证防伪密钥
+const AUTH_SECRET = process.env.AUTH_SECRET || "XiaoLin666";
 
 const githubApiUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_PATH}`;
 const githubHeaders = {
@@ -19,7 +18,6 @@ const githubHeaders = {
     'User-Agent': 'KeyAuth-Bot'
 };
 
-// 1. 读取 GitHub 上的 keys.txt
 async function getGithubKeys() {
     try {
         const res = await axios.get(githubApiUrl, { headers: githubHeaders });
@@ -31,7 +29,6 @@ async function getGithubKeys() {
     }
 }
 
-// 2. 自动写回 GitHub keys.txt
 async function updateGithubKeys(newContent, sha, commitMessage) {
     try {
         const encodedContent = Buffer.from(newContent, 'utf-8').toString('base64');
@@ -47,16 +44,12 @@ async function updateGithubKeys(newContent, sha, commitMessage) {
     }
 }
 
-// ---------------------------------------------------------
-// Express 网页接口：接收 Roblox 脚本发来的设备码
-// ---------------------------------------------------------
 const app = express();
 app.use(express.json());
 
 app.post('/api/bind-hwid', async (req, res) => {
     const { key, hwid, secret } = req.body;
 
-    // 检查密钥，防止坏人恶意发包
     if (secret !== AUTH_SECRET) {
         return res.status(403).json({ success: false, message: "验证密钥错误" });
     }
@@ -83,7 +76,6 @@ app.post('/api/bind-hwid', async (req, res) => {
         if (k === key) {
             keyFound = true;
             if (!boundHwid || boundHwid === '') {
-                // 如果这卡还没绑定设备，自动拼接当前 HWID
                 newLines.push(`${key}:${hwid}`);
                 isBound = true;
             } else {
@@ -102,7 +94,6 @@ app.post('/api/bind-hwid', async (req, res) => {
         return res.status(400).json({ success: false, message: "卡密已被其他设备占用" });
     }
 
-    // 更新到 GitHub
     const updatedContent = newLines.join('\n');
     const updateSuccess = await updateGithubKeys(updatedContent, sha, `自动绑定卡密 [${key}] 到设备 [${hwid}]`);
 
@@ -117,9 +108,6 @@ app.listen(PORT, () => {
     console.log(`绑定 API 服务已运行在端口: ${PORT}`);
 });
 
-// ---------------------------------------------------------
-// Discord 指令交互
-// ---------------------------------------------------------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 const commands = [
@@ -149,7 +137,6 @@ client.on('interactionCreate', async interaction => {
 
     const { commandName } = interaction;
 
-    -- Discord 批量生成卡密命令 (/genkey 100)
     if (commandName === 'genkey') {
         await interaction.deferReply();
         const count = interaction.options.getInteger('count');
@@ -171,7 +158,6 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    -- Discord 解绑卡密命令 (/resetkey XLKEY-XXXX)
     if (commandName === 'resetkey') {
         await interaction.deferReply();
         const keyToReset = interaction.options.getString('key');
@@ -183,7 +169,7 @@ client.on('interactionCreate', async interaction => {
             let [k] = line.split(':');
             if (k === keyToReset) {
                 found = true;
-                return k; // 清空后面的 :HWID
+                return k;
             }
             return line;
         });
