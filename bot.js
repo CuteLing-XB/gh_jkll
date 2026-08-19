@@ -3,6 +3,7 @@ const express = require('express');
 const axios = require('axios');
 require('dotenv').config();
 
+// 环境变量配置
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_OWNER = process.env.GITHUB_OWNER;
@@ -12,12 +13,24 @@ const GITHUB_BAN_PATH = 'blacklist.txt';
 const PORT = process.env.PORT || 3000;
 const AUTH_SECRET = process.env.AUTH_SECRET || "XiaoLin666";
 
+// 管理员专属卡密（写死在后端的白名单卡密）
+const ADMIN_KEYS = ["XLKEY-ADMIN888", "XLKEY-ADMIN999", "XiaoLinAdmin666"];
+
+// 内存中实时记录所有正在运行脚本的玩家: Map<RobloxUsername, { lastSeen: timestamp, key: string, hwid: string }>
+const activeScriptUsers = new Map();
+
+// 请求 GitHub API 的请求头
 const githubHeaders = {
     'Authorization': `token ${GITHUB_TOKEN}`,
     'Accept': 'application/vnd.github.v3+json',
     'User-Agent': 'KeyAuth-Bot'
 };
 
+// =========================================================
+// GitHub 读写工具函数
+// =========================================================
+
+// 读取 GitHub 文件
 async function getGithubFile(filePath) {
     const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`;
     try {
@@ -30,6 +43,7 @@ async function getGithubFile(filePath) {
     }
 }
 
+// 更新 GitHub 文件
 async function updateGithubFile(filePath, newContent, sha, message) {
     const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${filePath}`;
     try {
@@ -39,18 +53,28 @@ async function updateGithubFile(filePath, newContent, sha, message) {
         await axios.put(url, payload, { headers: githubHeaders });
         return true;
     } catch (err) {
+        console.error("写入 GitHub 失败:", err.message);
         return false;
     }
 }
 
+// =========================================================
+// Express Web API 路由配置
+// =========================================================
 const app = express();
 app.set('trust proxy', true);
 app.use(express.json());
 
-app.get('/', (req, res) => res.status(200).send({ status: "online", timestamp: new Date().toISOString() }));
-app.get('/health', (req, res) => res.status(200).send("OK"));
+// 首页心跳健康检查
+app.get('/', (req, res) => {
+    res.status(200).send({ status: "online", timestamp: new Date().toISOString() });
+});
 
-// 自助领卡 API
+app.get('/health', (req, res) => {
+    res.status(200).send("OK");
+});
+
+// 1. 自助领卡 API (网页 /get-key)
 app.get('/get-key', async (req, res) => {
     const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
     const { content, sha } = await getGithubFile(GITHUB_KEYS_PATH);
@@ -61,7 +85,7 @@ app.get('/get-key', async (req, res) => {
 
     let lines = content.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
-    // 检查此 IP 是否已经领过卡
+    // 判断该 IP 是否已经领过卡密
     for (let line of lines) {
         let parts = line.split(':');
         if (parts.length >= 3 && parts[1] === 'CLAIMED' && parts[2] === clientIp) {
@@ -77,7 +101,7 @@ app.get('/get-key', async (req, res) => {
         }
     }
 
-    // 查找未领取的卡密
+    // 寻找未使用的卡密
     let unclaimedIndex = -1;
     for (let i = 0; i < lines.length; i++) {
         if (!lines[i].includes(':')) {
@@ -87,14 +111,7 @@ app.get('/get-key', async (req, res) => {
     }
 
     if (unclaimedIndex === -1) {
-        return res.send(`
-            <html>
-                <body style="text-align:center;padding-top:60px;font-family:sans-serif;">
-                    <h2>卡密库存不足！</h2>
-                    <p>所有卡密已被领完，请联系管理员补货。</p>
-                </body>
-            </html>
-        `);
+        return res.send("<h2 style='text-align:center;'>卡密库存不足！请联系管理员补货。</h2>");
     }
 
     let assignedKey = lines[unclaimedIndex];
@@ -102,7 +119,7 @@ app.get('/get-key', async (req, res) => {
 
     let success = await updateGithubFile(GITHUB_KEYS_PATH, lines.join('\n'), sha, `Claim ${assignedKey} for IP ${clientIp}`);
     if (!success) {
-        return res.send("<h2 style='text-align:center;'>系统繁忙，请刷新页面重试！</h2>");
+        return res.send("<h2 style='text-align:center;'>系统繁忙，请刷新重试！</h2>");
     }
 
     return res.send(`
@@ -116,26 +133,40 @@ app.get('/get-key', async (req, res) => {
     `);
 });
 
-// 验证绑定 HWID API
+// 2. 客户端 HWID 绑定与心跳比对 API (/api/bind-hwid)
 app.post('/api/bind-hwid', async (req, res) => {
     const { key, hwid, secret, username } = req.body;
     if (secret !== AUTH_SECRET) return res.status(403).json({ success: false, message: "通讯密钥错误" });
 
-    if (username) {
+    const cleanKey = String(key || '').trim();
+    const cleanUsername = String(username || '').trim();
+
+    // 如果是管理员卡密，直接通过验证并开启管理员权限
+    if (ADMIN_KEYS.includes(cleanKey)) {
+        if (cleanUsername) {
+            activeScriptUsers.set(cleanUsername, { lastSeen: Date.now(), key: cleanKey, hwid: hwid, isAdmin: true });
+        }
+        return res.json({ success: true, isAdmin: true, message: "管理员验证通过！" });
+    }
+
+    // 普通玩家逻辑
+    if (cleanUsername) {
+        // 校验黑名单文件
         const { content: banContent } = await getGithubFile(GITHUB_BAN_PATH);
         if (banContent) {
             const bannedUsers = banContent.split(/\r?\n/).map(u => u.trim().toLowerCase());
-            if (bannedUsers.includes(String(username).trim().toLowerCase())) {
-                return res.status(403).json({ success: false, kicked: true, message: "玩家已被管理员拉黑封禁" });
+            if (bannedUsers.includes(cleanUsername.toLowerCase())) {
+                activeScriptUsers.delete(cleanUsername);
+                return res.status(403).json({ success: false, kicked: true, message: "该账号已被管理员列入黑名单并踢出！" });
             }
         }
+        // 刷新玩家在线心跳包
+        activeScriptUsers.set(cleanUsername, { lastSeen: Date.now(), key: cleanKey, hwid: hwid, isAdmin: false });
     }
 
-    if (!key || !hwid) return res.status(400).json({ success: false, message: "缺少请求参数" });
+    if (!cleanKey || !hwid) return res.status(400).json({ success: false, message: "缺少请求参数" });
 
-    const cleanKey = String(key).trim();
     const cleanHwid = String(hwid).trim();
-
     const { content, sha } = await getGithubFile(GITHUB_KEYS_PATH);
     if (!sha) return res.status(500).json({ success: false, message: "读取卡密库失败" });
 
@@ -182,57 +213,149 @@ app.post('/api/bind-hwid', async (req, res) => {
         const updatedContent = newLines.join('\n');
         const updateSuccess = await updateGithubFile(GITHUB_KEYS_PATH, updatedContent, sha, `Bind key ${cleanKey}`);
         if (updateSuccess) {
-            return res.json({ success: true, message: responseMessage });
+            return res.json({ success: true, isAdmin: false, message: responseMessage });
         } else {
             return res.status(500).json({ success: false, message: "写入卡密库失败" });
         }
     } else {
-        return res.json({ success: true, message: responseMessage });
+        return res.json({ success: true, isAdmin: false, message: responseMessage });
     }
 });
 
-app.listen(PORT, () => console.log(`服务已成功启动，运行端口: ${PORT}`));
+// 3. 获取【当前在线挂脚本玩家】API (/api/online-users)
+app.get('/api/online-users', (req, res) => {
+    const now = Date.now();
+    const onlineUsers = [];
 
+    activeScriptUsers.forEach((data, username) => {
+        // 超过 45 秒无心跳自动清除
+        if (now - data.lastSeen < 45000) {
+            onlineUsers.push(username);
+        } else {
+            activeScriptUsers.delete(username);
+        }
+    });
+
+    res.json({ success: true, users: onlineUsers });
+});
+
+// 4. 获取【黑名单玩家】API (/api/banned-users)
+app.get('/api/banned-users', async (req, res) => {
+    const { content } = await getGithubFile(GITHUB_BAN_PATH);
+    let bannedList = content ? content.split(/\r?\n/).map(u => u.trim()).filter(Boolean) : [];
+    res.json({ success: true, users: bannedList });
+});
+
+// 5. 客户端管理员远程 Kick 踢人 API (/api/admin-kick)
+app.post('/api/admin-kick', async (req, res) => {
+    const { adminKey, targetUser, secret } = req.body;
+    if (secret !== AUTH_SECRET) return res.status(403).json({ success: false, message: "未授权访问" });
+
+    const cleanAdminKey = String(adminKey || '').trim();
+    if (!ADMIN_KEYS.includes(cleanAdminKey)) {
+        return res.status(403).json({ success: false, message: "非管理员卡密，无权操作！" });
+    }
+
+    if (!targetUser) return res.status(400).json({ success: false, message: "请指定要踢出的目标 Roblox Username！" });
+
+    const cleanTarget = String(targetUser).trim();
+
+    const { content, sha } = await getGithubFile(GITHUB_BAN_PATH);
+    let banList = content ? content.split(/\r?\n/).map(u => u.trim()).filter(Boolean) : [];
+
+    if (!banList.some(u => u.toLowerCase() === cleanTarget.toLowerCase())) {
+        banList.push(cleanTarget);
+    }
+
+    activeScriptUsers.delete(cleanTarget);
+
+    let success = await updateGithubFile(GITHUB_BAN_PATH, banList.join('\n'), sha, `Admin Kick ${cleanTarget}`);
+    if (success) {
+        return res.json({ success: true, message: `已成功强行踢出并拉黑: [${cleanTarget}]` });
+    } else {
+        return res.status(500).json({ success: false, message: "写入黑名单失败" });
+    }
+});
+
+// 6. 客户端管理员远程 Unban 解封 API (/api/admin-unban)
+app.post('/api/admin-unban', async (req, res) => {
+    const { adminKey, targetUser, secret } = req.body;
+    if (secret !== AUTH_SECRET) return res.status(403).json({ success: false, message: "未授权访问" });
+
+    const cleanAdminKey = String(adminKey || '').trim();
+    if (!ADMIN_KEYS.includes(cleanAdminKey)) {
+        return res.status(403).json({ success: false, message: "非管理员卡密，无权操作！" });
+    }
+
+    if (!targetUser) return res.status(400).json({ success: false, message: "请指定要解封的目标 Roblox Username！" });
+
+    const cleanTarget = String(targetUser).trim();
+
+    const { content, sha } = await getGithubFile(GITHUB_BAN_PATH);
+    if (!content || !sha) return res.json({ success: true, message: "黑名单为空，无需解封！" });
+
+    let banList = content.split(/\r?\n/).map(u => u.trim()).filter(Boolean);
+    let initialLen = banList.length;
+    let newBanList = banList.filter(u => u.toLowerCase() !== cleanTarget.toLowerCase());
+
+    if (newBanList.length === initialLen) {
+        return res.status(404).json({ success: false, message: `黑名单中未找到玩家 [${cleanTarget}]` });
+    }
+
+    let success = await updateGithubFile(GITHUB_BAN_PATH, newBanList.join('\n'), sha, `Admin Unban ${cleanTarget}`);
+    if (success) {
+        return res.json({ success: true, message: `已成功解封玩家: [${cleanTarget}]` });
+    } else {
+        return res.status(500).json({ success: false, message: "更新黑名单文件失败" });
+    }
+});
+
+// 监听端口
+app.listen(PORT, () => console.log(`服务在端口 ${PORT} 上运行`));
+
+// =========================================================
+// Discord 机器人逻辑控制
+// =========================================================
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 const commands = [
     new SlashCommandBuilder()
         .setName('genkey')
         .setDescription('【管理员】批量生成卡密')
-        .addIntegerOption(opt => opt.setName('count').setDescription('生成卡密数量 (1-100)').setRequired(true))
+        .addIntegerOption(opt => opt.setName('count').setDescription('生成数量 (1-100)').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
     new SlashCommandBuilder()
         .setName('resetkey')
-        .setDescription('【管理员】解绑卡密设备 (HWID)')
+        .setDescription('【管理员】重置卡密绑定设备 (HWID)')
         .addStringOption(opt => opt.setName('key').setDescription('卡密').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
     new SlashCommandBuilder()
         .setName('delkey')
-        .setDescription('【管理员】作废删除卡密')
+        .setDescription('【管理员】删除/作废指定卡密')
         .addStringOption(opt => opt.setName('key').setDescription('卡密').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
     new SlashCommandBuilder()
         .setName('banuser')
-        .setDescription('【管理员】拉黑/远程踢出 Roblox 玩家')
+        .setDescription('【管理员】拉黑 Roblox 用户名')
         .addStringOption(opt => opt.setName('username').setDescription('Roblox 用户名').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
     new SlashCommandBuilder()
         .setName('unbanuser')
-        .setDescription('【管理员】解封 Roblox 玩家')
+        .setDescription('【管理员】解封 Roblox 用户名')
         .addStringOption(opt => opt.setName('username').setDescription('Roblox 用户名').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ];
 
 client.on('ready', async () => {
-    console.log(`Discord 机器人已上线: ${client.user.tag}`);
+    console.log(`Discord 机器人已登录: ${client.user.tag}`);
     const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
     try {
         await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-        console.log("Discord 斜杠指令注册完成");
+        console.log("Discord 斜杠指令已成功注册！");
     } catch (err) {
         console.error("注册斜杠指令失败:", err);
     }
@@ -251,7 +374,7 @@ client.on('interactionCreate', async interaction => {
     if (commandName === 'genkey') {
         await interaction.deferReply({ ephemeral: true });
         const count = interaction.options.getInteger('count');
-        if (count <= 0 || count > 100) return interaction.editReply("数量必须在 1 到 100 之间！");
+        if (count <= 0 || count > 100) return interaction.editReply("生成数量必须在 1 到 100 之间！");
 
         const { content, sha } = await getGithubFile(GITHUB_KEYS_PATH);
         if (!sha) return interaction.editReply("❌ 读取云端卡密库失败！");
@@ -294,7 +417,7 @@ client.on('interactionCreate', async interaction => {
 
         let success = await updateGithubFile(GITHUB_KEYS_PATH, newLines.join('\n'), sha, `Reset ${keyToReset}`);
         if (success) {
-            await interaction.editReply(`✅ 卡密 \`${keyToReset}\` 的设备绑定信息已清空，可重新绑定新机器！`);
+            await interaction.editReply(`✅ 卡密 \`${keyToReset}\` HWID 设备绑定已清空！`);
         } else {
             await interaction.editReply("❌ 更新卡密库失败！");
         }
@@ -324,7 +447,7 @@ client.on('interactionCreate', async interaction => {
 
         let success = await updateGithubFile(GITHUB_KEYS_PATH, newLines.join('\n'), sha, `Delete ${keyToDelete}`);
         if (success) {
-            await interaction.editReply(`🚨 卡密 \`${keyToDelete}\` 已被彻底作废销毁！`);
+            await interaction.editReply(`🚨 卡密 \`${keyToDelete}\` 已作废删除！`);
         } else {
             await interaction.editReply("❌ 更新卡密库失败！");
         }
@@ -338,14 +461,14 @@ client.on('interactionCreate', async interaction => {
 
         let banList = content ? content.split(/\r?\n/).map(u => u.trim()).filter(Boolean) : [];
         if (banList.some(u => u.toLowerCase() === targetUser.toLowerCase())) {
-            return interaction.editReply(`⚠️ 玩家 \`${targetUser}\` 已经在黑名单中了！`);
+            return interaction.editReply(`⚠️ 玩家 \`${targetUser}\` 已在黑名单中！`);
         }
 
         banList.push(targetUser);
         let success = await updateGithubFile(GITHUB_BAN_PATH, banList.join('\n'), sha, `Ban ${targetUser}`);
 
         if (success) {
-            await interaction.editReply(`⛔ **玩家已封禁**：\`${targetUser}\` 已加入黑名单，在线将被自动踢出！`);
+            await interaction.editReply(`⛔ 玩家 \`${targetUser}\` 已拉黑！系统将在几秒内将其剔除断线。`);
         } else {
             await interaction.editReply("❌ 写入黑名单失败！");
         }
@@ -357,22 +480,22 @@ client.on('interactionCreate', async interaction => {
         const targetUser = interaction.options.getString('username').trim();
         const { content, sha } = await getGithubFile(GITHUB_BAN_PATH);
 
-        if (!content || !sha) return interaction.editReply("⚠️ 黑名单为空，无需解封！");
+        if (!content || !sha) return interaction.editReply("⚠️ 黑名单为空！");
 
         let banList = content.split(/\r?\n/).map(u => u.trim()).filter(Boolean);
-        let initialLength = banList.length;
+        let initialLen = banList.length;
         let newBanList = banList.filter(u => u.toLowerCase() !== targetUser.toLowerCase());
 
-        if (newBanList.length === initialLength) {
-            return interaction.editReply(`❌ 在黑名单中未找到玩家 \`${targetUser}\`！`);
+        if (newBanList.length === initialLen) {
+            return interaction.editReply(`❌ 黑名单中未找到玩家 \`${targetUser}\`！`);
         }
 
         let success = await updateGithubFile(GITHUB_BAN_PATH, newBanList.join('\n'), sha, `Unban ${targetUser}`);
 
         if (success) {
-            await interaction.editReply(`✅ **玩家已解封**：\`${targetUser}\` 已从黑名单中移除，可正常使用脚本！`);
+            await interaction.editReply(`✅ 玩家 \`${targetUser}\` 已解封！可重新进入使用脚本。`);
         } else {
-            await interaction.editReply("❌ 解封更新失败！");
+            await interaction.editReply("❌ 更新黑名单失败！");
         }
     }
 });
