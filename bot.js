@@ -13,18 +13,14 @@ const GITHUB_BAN_PATH = 'blacklist.txt';
 const PORT = process.env.PORT || 3000;
 const AUTH_SECRET = process.env.AUTH_SECRET || "XiaoLin666";
 
-// 超时设置：10 分钟未绑定则自动回收卡密
-const KEY_TIMEOUT_MINUTES = 10;
-const RECLAIM_CHECK_INTERVAL_MINUTES = 2; // 每 2 分钟巡检一次
+const KEY_TIMEOUT_MINUTES = 10; // 领卡 10 分钟未绑定自动回收
+const RECLAIM_CHECK_INTERVAL_MINUTES = 2; // 每 2 分钟检查一次
 
 const ADMIN_KEYS = new Set(["LNMKG-917813", "XQWTU-78918888", "XLKEY-ADMIN888", "XLKEY-ADMIN999", "XiaoLinAdmin666"]);
 
-// 内存极速数据库（使用 Map 实现 O(1) 零循环查找）
 // keyStore: Map<Key, { status: string, owner: string, claimedAt?: number }>
 const keyStore = new Map();
-// banSet: Set<UsernameLowercase>
 const banSet = new Set();
-// activeUsers: Map<Username, { lastSeen: number, key: string, hwid: string }>
 const activeUsers = new Map();
 
 let keysSha = null;
@@ -38,12 +34,16 @@ const githubHeaders = {
     'User-Agent': 'KeyAuth-FastBot'
 };
 
+// 判断一个字符串是 HWID 还是纯 IP 地址
+function isIPAddress(str) {
+    if (!str) return false;
+    return /^(\d{1,3}\.){3}\d{1,3}$/.test(str.trim());
+}
+
 // ================= 内存数据与云端同步 =================
 
-// 初始化：将 GitHub 数据一次性加载进内存
 async function initMemoryFromGithub() {
     try {
-        // 读取 Keys
         const keysUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_KEYS_PATH}`;
         const keysRes = await axios.get(keysUrl, { headers: githubHeaders, timeout: 5000 });
         keysSha = keysRes.data.sha;
@@ -55,12 +55,21 @@ async function initMemoryFromGithub() {
             if (!trimmed) return;
             const parts = trimmed.split(':');
             const k = parts[0]?.trim();
-            if (k) {
-                const status = parts[1]?.trim() || '';
-                const owner = parts[2]?.trim() || '';
-                // 如果是已领取的卡密，默认初始化为当前时间（防止服务重启后时间丢失）
-                const claimedAt = (status === 'CLAIMED') ? Date.now() : undefined;
-                keyStore.set(k, { status, owner, claimedAt });
+            if (!k) return;
+
+            let part1 = parts[1]?.trim() || '';
+            let part2 = parts[2]?.trim() || '';
+
+            // 情况1: KEY:CLAIMED:IP 或 KEY:HWID:IP
+            if (part1 === 'CLAIMED' || isIPAddress(part2)) {
+                // 如果没有 HWID 只有 IP，标记为 CLAIMED（并赋予一个初始超时时间，让它能被回收）
+                keyStore.set(k, { status: 'CLAIMED', owner: part2 || part1, claimedAt: Date.now() - (KEY_TIMEOUT_MINUTES * 60 * 1000 + 1000) });
+            } else if (part1) {
+                // 情况2: KEY:HWID (已绑定设备的正常卡)
+                keyStore.set(k, { status: part1, owner: part2 });
+            } else {
+                // 情况3: 纯 KEY (全新未领)
+                keyStore.set(k, { status: '', owner: '' });
             }
         });
 
@@ -81,17 +90,18 @@ async function initMemoryFromGithub() {
     }
 }
 
-// 异步静默持久化到 GitHub（不阻碍客户端 API 响应）
 async function syncKeysToGithubAsync() {
     if (isSavingKeys) return;
     isSavingKeys = true;
     try {
         const lines = [];
         keyStore.forEach((val, k) => {
-            if (val.status) {
+            if (val.status === 'CLAIMED') {
+                lines.push(`${k}:CLAIMED:${val.owner}`);
+            } else if (val.status) {
                 lines.push(val.owner ? `${k}:${val.status}:${val.owner}` : `${k}:${val.status}`);
             } else {
-                lines.push(k);
+                lines.push(k); // 空卡只保留 KEY
             }
         });
         const content = lines.join('\n');
@@ -122,24 +132,17 @@ async function syncBanToGithubAsync() {
     }
 }
 
-// ================= 卡密超时自动回收逻辑 =================
+// ================= 超时回收与旧 IP 强制清理 =================
 
-/**
- * 回收领卡后超过指定时间未绑定 HWID 的 CLAIMED 卡密
- * @param {number} timeoutMinutes 超时分钟数
- * @returns {number} 回收的卡密数量
- */
 function reclaimUnusedKeys(timeoutMinutes = KEY_TIMEOUT_MINUTES) {
     const now = Date.now();
     const timeoutMs = timeoutMinutes * 60 * 1000;
     let reclaimedCount = 0;
 
     for (const [k, val] of keyStore.entries()) {
-        // 条件：状态是 CLAIMED，且领卡时间超过了预设分钟数
         if (val.status === 'CLAIMED') {
             const claimedTime = val.claimedAt || 0;
             if (now - claimedTime > timeoutMs) {
-                // 重置卡密状态为初始未被使用状态
                 keyStore.set(k, { status: '', owner: '' });
                 reclaimedCount++;
             }
@@ -147,17 +150,28 @@ function reclaimUnusedKeys(timeoutMinutes = KEY_TIMEOUT_MINUTES) {
     }
 
     if (reclaimedCount > 0) {
-        console.log(`[卡密自动回收] 成功收回 ${reclaimedCount} 张超过 ${timeoutMinutes} 分钟未使用的卡密！`);
-        syncKeysToGithubAsync(); // 异步更新到云端
+        console.log(`[回收成功] 清理了 ${reclaimedCount} 张超过 ${timeoutMinutes} 分钟未绑定的卡密`);
+        syncKeysToGithubAsync();
     }
-
     return reclaimedCount;
 }
 
-// 启动定时回收任务
-setInterval(() => {
-    reclaimUnusedKeys(KEY_TIMEOUT_MINUTES);
-}, RECLAIM_CHECK_INTERVAL_MINUTES * 60 * 1000);
+// 强制清空【所有】只有 IP 没绑定设备码的废卡
+function forceCleanAllIPKeys() {
+    let count = 0;
+    for (const [k, val] of keyStore.entries()) {
+        if (val.status === 'CLAIMED' || isIPAddress(val.status) || isIPAddress(val.owner)) {
+            keyStore.set(k, { status: '', owner: '' });
+            count++;
+        }
+    }
+    if (count > 0) {
+        syncKeysToGithubAsync();
+    }
+    return count;
+}
+
+setInterval(() => reclaimUnusedKeys(KEY_TIMEOUT_MINUTES), RECLAIM_CHECK_INTERVAL_MINUTES * 60 * 1000);
 
 // ================= Express Web API 路由 =================
 const app = express();
@@ -167,26 +181,28 @@ app.use(express.json());
 app.get('/', (req, res) => res.status(200).send({ status: "online", memoryKeys: keyStore.size }));
 app.get('/health', (req, res) => res.status(200).send("OK"));
 
-// 1. 自助领卡 API (网页 /get-key)
+// 🌟 一键清理所有历史 IP 废卡的紧急 API（用浏览器访问一下这个链接就能把 GitHub 上所有没用过的卡全重置）
+app.get('/api/force-clean-ips', (req, res) => {
+    const cleaned = forceCleanAllIPKeys();
+    res.send(`<h1>清理成功！共重置并重新投放了 ${cleaned} 张只有 IP 没有绑定设备码的卡密！GitHub 正在后台更新...</h1>`);
+});
+
+// 1. 自助领卡 API (/get-key)
 app.get('/get-key', (req, res) => {
     const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
     const now = Date.now();
     const timeoutMs = KEY_TIMEOUT_MINUTES * 60 * 1000;
 
-    // 先检测该 IP 是否有【未超时】的 CLAIMED 卡密
     for (const [k, val] of keyStore.entries()) {
         if (val.status === 'CLAIMED' && val.owner === clientIp) {
-            // 如果该 IP 领取的卡密还没超时，直接返回给用户
             if (val.claimedAt && (now - val.claimedAt <= timeoutMs)) {
                 return res.send(`<h2>您已领取过卡密（${KEY_TIMEOUT_MINUTES}分钟内有效，请尽快绑定）：</h2><h1 style="color:#0051ff;">${k}</h1>`);
             }
         }
     }
 
-    // 在领卡前，立即做一次过期回收
     reclaimUnusedKeys(KEY_TIMEOUT_MINUTES);
 
-    // 寻找未使用的卡密
     let foundKey = null;
     for (const [k, val] of keyStore.entries()) {
         if (!val.status) {
@@ -197,19 +213,18 @@ app.get('/get-key', (req, res) => {
 
     if (!foundKey) return res.send("<h2>卡密库存不足！</h2>");
 
-    // 标记卡密状态为 CLAIMED，并记录当前时间和 IP
     keyStore.set(foundKey, { 
         status: 'CLAIMED', 
         owner: clientIp, 
         claimedAt: Date.now() 
     });
     
-    syncKeysToGithubAsync(); // 异步写入，直接响应网页
+    syncKeysToGithubAsync();
 
     return res.send(`<h2>您的专属卡密（请在 ${KEY_TIMEOUT_MINUTES} 分钟内使用）：</h2><h1 style="color:#0051ff;">${foundKey}</h1>`);
 });
 
-// 2. 客户端卡密 HWID 验证 API (/api/bind-hwid) — 极速响应！
+// 2. 客户端卡密 HWID 验证 API (/api/bind-hwid)
 app.post('/api/bind-hwid', (req, res) => {
     const { key, hwid, secret, username } = req.body;
     if (secret !== AUTH_SECRET) return res.status(403).json({ success: false, message: "密钥错误" });
@@ -218,13 +233,11 @@ app.post('/api/bind-hwid', (req, res) => {
     const cleanUser = String(username || '').trim();
     const cleanHwid = String(hwid || '').trim();
 
-    // 1. 黑名单内存比对 O(1)
     if (cleanUser && banSet.has(cleanUser.toLowerCase())) {
         activeUsers.delete(cleanUser);
         return res.status(403).json({ success: false, kicked: true, message: "玩家已被列入黑名单" });
     }
 
-    // 2. 管理员卡密白名单比对 O(1)
     if (ADMIN_KEYS.has(cleanKey)) {
         if (cleanUser) activeUsers.set(cleanUser, { lastSeen: Date.now(), key: cleanKey, hwid: cleanHwid });
         return res.json({ success: true, isAdmin: true, message: "管理员登录成功！" });
@@ -232,7 +245,6 @@ app.post('/api/bind-hwid', (req, res) => {
 
     if (!cleanKey || !cleanHwid) return res.status(400).json({ success: false, message: "缺失关键参数" });
 
-    // 3. 卡密内存比对 O(1) — 零循环！
     const keyData = keyStore.get(cleanKey);
     if (!keyData) return res.status(404).json({ success: false, message: "卡密不存在或已被删除" });
 
@@ -241,10 +253,8 @@ app.post('/api/bind-hwid', (req, res) => {
     let needSync = false;
 
     if (!keyData.status || keyData.status === 'CLAIMED') {
-        // 绑定 HWID，并将 claimedAt 清空（成功绑定后不再被超时清理）
         keyData.status = cleanHwid;
         delete keyData.claimedAt;
-        
         authPassed = true;
         needSync = true;
         msg = "首次登录，成功绑定设备";
@@ -260,7 +270,6 @@ app.post('/api/bind-hwid', (req, res) => {
 
     if (cleanUser) activeUsers.set(cleanUser, { lastSeen: Date.now(), key: cleanKey, hwid: cleanHwid });
 
-    // 异步同步到云端，不耽误客户端毫秒级返回
     if (needSync) syncKeysToGithubAsync();
 
     return res.json({ success: true, isAdmin: false, message: msg });
@@ -271,7 +280,7 @@ app.get('/api/online-users', (req, res) => {
     const now = Date.now();
     const list = [];
     activeUsers.forEach((val, user) => {
-        if (now - val.lastSeen < 90000) { // 90秒无心跳判定离线
+        if (now - val.lastSeen < 90000) {
             list.push(user);
         } else {
             activeUsers.delete(user);
@@ -285,7 +294,7 @@ app.get('/api/banned-users', (req, res) => {
     res.json({ success: true, users: Array.from(banSet) });
 });
 
-// 5. 远程 Kick 踢人
+// 5. 远程 Kick
 app.post('/api/admin-kick', (req, res) => {
     const { adminKey, targetUser, secret } = req.body;
     if (secret !== AUTH_SECRET) return res.status(403).json({ success: false, message: "未授权" });
@@ -301,7 +310,7 @@ app.post('/api/admin-kick', (req, res) => {
     res.json({ success: true, message: `已强行拉黑并踢出玩家: [${target}]` });
 });
 
-// 6. 远程 Unban 解封
+// 6. 远程 Unban
 app.post('/api/admin-unban', (req, res) => {
     const { adminKey, targetUser, secret } = req.body;
     if (secret !== AUTH_SECRET) return res.status(403).json({ success: false, message: "未授权" });
@@ -316,7 +325,7 @@ app.post('/api/admin-unban', (req, res) => {
     res.json({ success: true, message: `已成功解封玩家: [${targetUser}]` });
 });
 
-// 启动服务器并同步内存
+// 启动服务器
 app.listen(PORT, () => {
     console.log(`[服务器已启动] 端口 ${PORT}`);
     initMemoryFromGithub();
@@ -331,7 +340,7 @@ const commands = [
     new SlashCommandBuilder().setName('delkey').setDescription('【管理员】删除/作废卡密').addStringOption(o => o.setName('key').setDescription('卡密').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     new SlashCommandBuilder().setName('banuser').setDescription('【管理员】拉黑玩家').addStringOption(o => o.setName('username').setDescription('用户名').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     new SlashCommandBuilder().setName('unbanuser').setDescription('【管理员】解封玩家').addStringOption(o => o.setName('username').setDescription('用户名').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-    new SlashCommandBuilder().setName('reclaim').setDescription('【管理员】立即回收放回超过指定分钟未使用的卡密').addIntegerOption(o => o.setName('minutes').setDescription('分钟数（默认10分钟）').setRequired(false)).setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    new SlashCommandBuilder().setName('reclaim').setDescription('【管理员】清理所有未绑定设备的 IP 卡密').setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ];
 
 client.on('ready', async () => {
@@ -395,9 +404,8 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (commandName === 'reclaim') {
-        const minutes = interaction.options.getInteger('minutes') || KEY_TIMEOUT_MINUTES;
-        const reclaimed = reclaimUnusedKeys(minutes);
-        return interaction.reply({ content: `🧹 手动清理完成！共收回 **${reclaimed}** 张领取超过 **${minutes}** 分钟未绑定的卡密。`, ephemeral: true });
+        const count = forceCleanAllIPKeys();
+        return interaction.reply({ content: `🧹 手动清理完成！共强制收回 **${count}** 张只有 IP 未绑定设备的卡密并已重置投放。`, ephemeral: true });
     }
 });
 
