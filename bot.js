@@ -21,6 +21,7 @@ const activeUsers = new Map();
 
 let keysSha = null;
 let isSavingKeys = false;
+let saveTimer = null; // 用于防抖节流的定时器
 
 const githubHeaders = {
     'Authorization': `token ${GITHUB_TOKEN}`,
@@ -44,12 +45,13 @@ async function initMemoryFromGithub() {
         const keysText = Buffer.from(keysRes.data.content, 'base64').toString('utf-8');
         
         keyStore.clear();
-        keysText.split(/\r?\n/).forEach(line => {
-            const trimmed = line.trim();
-            if (!trimmed) return;
+        const lines = keysText.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+            const trimmed = lines[i].trim();
+            if (!trimmed) continue;
             const parts = trimmed.split(':');
             const k = parts[0]?.trim();
-            if (!k) return;
+            if (!k) continue;
 
             const tag = parts[1]?.trim() || '';
             const p2 = parts[2]?.trim() || '';
@@ -70,12 +72,20 @@ async function initMemoryFromGithub() {
             } else {
                 keyStore.set(k, { status: 'EMPTY' });
             }
-        });
+        }
 
         console.log(`[初始化成功] 内存加载了 ${keyStore.size} 条卡密`);
     } catch (err) {
         console.error("[初始化失败] 读取 GitHub 异常:", err.message);
     }
+}
+
+// 防抖高并发云端同步：避免每次 API 调用都直接打 GitHub 造成卡顿与限流
+function scheduleSyncToGithub() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+        syncKeysToGithubAsync();
+    }, 3000); // 延迟 3 秒统一批量提交写操作
 }
 
 async function syncKeysToGithubAsync() {
@@ -96,7 +106,7 @@ async function syncKeysToGithubAsync() {
         });
         const content = lines.join('\n');
         const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_KEYS_PATH}`;
-        const payload = { message: "Async sync keys", content: Buffer.from(content, 'utf-8').toString('base64'), sha: keysSha };
+        const payload = { message: "Async sync keys batch", content: Buffer.from(content, 'utf-8').toString('base64'), sha: keysSha };
         const res = await axios.put(url, payload, { headers: githubHeaders });
         if (res.data?.content?.sha) keysSha = res.data.content.sha;
     } catch (e) {
@@ -116,7 +126,6 @@ function reclaimUnusedKeys(timeoutMinutes = KEY_TIMEOUT_MINUTES) {
     for (const [k, val] of keyStore.entries()) {
         if (val.status === 'CLAIMED') {
             const claimedTime = val.claimedAt || 0;
-            // 只有领卡且未在客户端绑定 HWID 且已超过 10 分钟的卡密才会被重置为 EMPTY
             if (now - claimedTime > timeoutMs) {
                 keyStore.set(k, { status: 'EMPTY' });
                 reclaimedCount++;
@@ -126,7 +135,7 @@ function reclaimUnusedKeys(timeoutMinutes = KEY_TIMEOUT_MINUTES) {
 
     if (reclaimedCount > 0) {
         console.log(`[回收成功] 清理了 ${reclaimedCount} 张超过 ${timeoutMinutes} 分钟未绑定的卡密`);
-        syncKeysToGithubAsync();
+        scheduleSyncToGithub();
     }
     return reclaimedCount;
 }
@@ -140,7 +149,7 @@ function forceCleanAllIPKeys() {
         }
     }
     if (count > 0) {
-        syncKeysToGithubAsync();
+        scheduleSyncToGithub();
     }
     return count;
 }
@@ -154,12 +163,22 @@ function resetAllKeyBindings() {
         }
     }
     if (resetCount > 0) {
-        syncKeysToGithubAsync();
+        scheduleSyncToGithub();
     }
     return resetCount;
 }
 
+// 后台定时任务：自动回收未绑定卡密与清理过期在线玩家
 setInterval(() => reclaimUnusedKeys(KEY_TIMEOUT_MINUTES), RECLAIM_CHECK_INTERVAL_MINUTES * 60 * 1000);
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [user, val] of activeUsers.entries()) {
+        if (now - val.lastSeen >= 90000) {
+            activeUsers.delete(user);
+        }
+    }
+}, 30000);
 
 // ================= Express Web API 路由 =================
 const app = express();
@@ -183,20 +202,20 @@ app.get('/api/reset-all-keys', (req, res) => {
     res.send(`<h1>重置成功！共解绑并重置了 ${resetCount} 张卡密！</h1>`);
 });
 
-// 1. 自助领卡 API (/get-key)
+// 1. 自助领卡 API (/get-key) - 内存极致响应
 app.get('/get-key', (req, res) => {
     const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
     const now = Date.now();
     const timeoutMs = KEY_TIMEOUT_MINUTES * 60 * 1000;
 
-    // 检查1：优先检测该 IP 是否已经绑卡（状态为 BOUND 且 IP 对应）
+    // 优先匹配已绑定的卡密
     for (const [k, val] of keyStore.entries()) {
         if (val.status === 'BOUND' && val.ip === clientIp) {
             return res.send(`<h2>您已成功绑定设备，您的专属卡密为：</h2><h1 style="color:#0051ff;">${k}</h1>`);
         }
     }
 
-    // 检查2：检测该 IP 是否在 10 分钟内领过卡（状态为 CLAIMED 且未超时）
+    // 匹配同 IP 10 分钟内领过的卡密（刷新防重复发新卡）
     for (const [k, val] of keyStore.entries()) {
         if (val.status === 'CLAIMED' && val.ip === clientIp) {
             if (val.claimedAt && (now - val.claimedAt <= timeoutMs)) {
@@ -205,10 +224,7 @@ app.get('/get-key', (req, res) => {
         }
     }
 
-    // 回收处理：触发超时回收，清理过期未绑定的废卡
-    reclaimUnusedKeys(KEY_TIMEOUT_MINUTES);
-
-    // 寻找全新空闲卡密（要求 status===EMPTY 且不带 ip 与 hwid）
+    // 寻找全新空闲卡密
     let foundKey = null;
     for (const [k, val] of keyStore.entries()) {
         if (val.status === 'EMPTY' && !val.ip && !val.hwid) {
@@ -219,19 +235,20 @@ app.get('/get-key', (req, res) => {
 
     if (!foundKey) return res.send("<h2>卡密库存不足！</h2>");
 
-    // 锁定该卡密给此 IP
+    // 快速写内存，立即响应客户端
     keyStore.set(foundKey, { 
         status: 'CLAIMED', 
         ip: clientIp, 
         claimedAt: Date.now() 
     });
     
-    syncKeysToGithubAsync();
+    // 异步防抖入库，不阻塞玩家
+    scheduleSyncToGithub();
 
     return res.send(`<h2>您的专属卡密（请在 ${KEY_TIMEOUT_MINUTES} 分钟内绑定）：</h2><h1 style="color:#0051ff;">${foundKey}</h1>`);
 });
 
-// 2. 客户端卡密 HWID 验证与绑定 API (/api/bind-hwid)
+// 2. 客户端卡密 HWID 验证与绑定 API (/api/bind-hwid) - 极速响应
 app.post('/api/bind-hwid', (req, res) => {
     const { key, hwid, secret, username } = req.body;
     if (secret !== AUTH_SECRET) return res.status(403).json({ success: false, message: "密钥错误" });
@@ -246,7 +263,6 @@ app.post('/api/bind-hwid', (req, res) => {
     const keyData = keyStore.get(cleanKey);
     if (!keyData) return res.status(404).json({ success: false, message: "卡密不存在或已被删除" });
 
-    // 检查卡密是否被管理员封禁
     if (keyData.status === 'DISABLED') {
         return res.status(403).json({ success: false, message: "该卡密已被管理员封禁" });
     }
@@ -255,12 +271,11 @@ app.post('/api/bind-hwid', (req, res) => {
     let msg = "";
     let needSync = false;
 
-    // 绑定逻辑：初次登录绑定 HWID 与当前 IP
     if (keyData.status === 'EMPTY' || keyData.status === 'CLAIMED' || !keyData.status) {
         keyData.status = 'BOUND';
         keyData.hwid = cleanHwid;
-        if (clientIp) keyData.ip = clientIp; // 锁定绑定时的 IP
-        delete keyData.claimedAt;           // 移除倒计时标记
+        if (clientIp) keyData.ip = clientIp;
+        delete keyData.claimedAt;
         authPassed = true;
         needSync = true;
         msg = "首次登录，成功绑定设备";
@@ -276,22 +291,14 @@ app.post('/api/bind-hwid', (req, res) => {
 
     if (cleanUser) activeUsers.set(cleanUser, { lastSeen: Date.now(), key: cleanKey, hwid: cleanHwid });
 
-    if (needSync) syncKeysToGithubAsync();
+    if (needSync) scheduleSyncToGithub();
 
     return res.json({ success: true, isAdmin: false, message: msg });
 });
 
 // 3. 在线玩家列表
 app.get('/api/online-users', (req, res) => {
-    const now = Date.now();
-    const list = [];
-    activeUsers.forEach((val, user) => {
-        if (now - val.lastSeen < 90000) {
-            list.push(user);
-        } else {
-            activeUsers.delete(user);
-        }
-    });
+    const list = Array.from(activeUsers.keys());
     res.json({ success: true, users: list });
 });
 
@@ -340,7 +347,7 @@ client.on('interactionCreate', async interaction => {
             keyStore.set(k, { status: 'EMPTY' });
             newKeys.push(k);
         }
-        syncKeysToGithubAsync();
+        scheduleSyncToGithub();
         return interaction.reply({ content: `✅ 成功生成 **${count}** 张卡密：\n\`\`\`text\n${newKeys.join('\n')}\n\`\`\``, ephemeral: true });
     }
 
@@ -348,7 +355,7 @@ client.on('interactionCreate', async interaction => {
         const k = interaction.options.getString('key').trim();
         if (!keyStore.has(k)) return interaction.reply({ content: `❌ 未找到卡密 \`${k}\``, ephemeral: true });
         keyStore.set(k, { status: 'EMPTY' });
-        syncKeysToGithubAsync();
+        scheduleSyncToGithub();
         return interaction.reply({ content: `✅ 卡密 \`${k}\` HWID 绑定已重置`, ephemeral: true });
     }
 
@@ -356,7 +363,7 @@ client.on('interactionCreate', async interaction => {
         const k = interaction.options.getString('key').trim();
         if (!keyStore.has(k)) return interaction.reply({ content: `❌ 未找到卡密 \`${k}\``, ephemeral: true });
         keyStore.set(k, { status: 'DISABLED' });
-        syncKeysToGithubAsync();
+        scheduleSyncToGithub();
         return interaction.reply({ content: `⛔ 卡密 \`${k}\` 已成功封禁/禁用！`, ephemeral: true });
     }
 
@@ -364,7 +371,7 @@ client.on('interactionCreate', async interaction => {
         const k = interaction.options.getString('key').trim();
         if (!keyStore.has(k)) return interaction.reply({ content: `❌ 未找到卡密 \`${k}\``, ephemeral: true });
         keyStore.set(k, { status: 'EMPTY' });
-        syncKeysToGithubAsync();
+        scheduleSyncToGithub();
         return interaction.reply({ content: `✅ 卡密 \`${k}\` 已解封并恢复为未绑定状态！`, ephemeral: true });
     }
 
@@ -377,7 +384,7 @@ client.on('interactionCreate', async interaction => {
         const k = interaction.options.getString('key').trim();
         if (!keyStore.has(k)) return interaction.reply({ content: `❌ 未找到卡密 \`${k}\``, ephemeral: true });
         keyStore.delete(k);
-        syncKeysToGithubAsync();
+        scheduleSyncToGithub();
         return interaction.reply({ content: `🚨 卡密 \`${k}\` 已销毁删除`, ephemeral: true });
     }
 
