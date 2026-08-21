@@ -132,7 +132,7 @@ async function syncBanToGithubAsync() {
     }
 }
 
-// ================= 超时回收与旧 IP 强制清理 =================
+// ================= 超时回收与清理逻辑 =================
 
 function reclaimUnusedKeys(timeoutMinutes = KEY_TIMEOUT_MINUTES) {
     const now = Date.now();
@@ -171,6 +171,21 @@ function forceCleanAllIPKeys() {
     return count;
 }
 
+// 🌟 新增：强制清空【所有卡密】的设备绑定（无论是 HWID 还是 IP）
+function resetAllKeyBindings() {
+    let resetCount = 0;
+    for (const [k, val] of keyStore.entries()) {
+        if (val.status !== '' || val.owner !== '') {
+            keyStore.set(k, { status: '', owner: '' });
+            resetCount++;
+        }
+    }
+    if (resetCount > 0) {
+        syncKeysToGithubAsync();
+    }
+    return resetCount;
+}
+
 setInterval(() => reclaimUnusedKeys(KEY_TIMEOUT_MINUTES), RECLAIM_CHECK_INTERVAL_MINUTES * 60 * 1000);
 
 // ================= Express Web API 路由 =================
@@ -181,10 +196,21 @@ app.use(express.json());
 app.get('/', (req, res) => res.status(200).send({ status: "online", memoryKeys: keyStore.size }));
 app.get('/health', (req, res) => res.status(200).send("OK"));
 
-// 🌟 一键清理所有历史 IP 废卡的紧急 API（用浏览器访问一下这个链接就能把 GitHub 上所有没用过的卡全重置）
+// 一键清理所有历史 IP 废卡的紧急 API
 app.get('/api/force-clean-ips', (req, res) => {
     const cleaned = forceCleanAllIPKeys();
     res.send(`<h1>清理成功！共重置并重新投放了 ${cleaned} 张只有 IP 没有绑定设备码的卡密！GitHub 正在后台更新...</h1>`);
+});
+
+// 🌟 一键清空所有卡密设备/HWID绑定的 Web API
+// 使用方法: 浏览器访问 http://域名/api/reset-all-keys?secret=XiaoLin666
+app.get('/api/reset-all-keys', (req, res) => {
+    const secret = req.query.secret;
+    if (secret !== AUTH_SECRET) {
+        return res.status(403).send("<h1>验证失败：安全密钥错误！</h1>");
+    }
+    const resetCount = resetAllKeyBindings();
+    res.send(`<h1>重置成功！共解绑并重置了 ${resetCount} 张卡密的设备与IP绑定！GitHub 正在后台同步更新...</h1>`);
 });
 
 // 1. 自助领卡 API (/get-key)
@@ -336,7 +362,8 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 const commands = [
     new SlashCommandBuilder().setName('genkey').setDescription('【管理员】批量生成卡密').addIntegerOption(o => o.setName('count').setDescription('数量').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-    new SlashCommandBuilder().setName('resetkey').setDescription('【管理员】重置卡密绑定设备').addStringOption(o => o.setName('key').setDescription('卡密').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    new SlashCommandBuilder().setName('resetkey').setDescription('【管理员】重置单个卡密绑定设备').addStringOption(o => o.setName('key').setDescription('卡密').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    new SlashCommandBuilder().setName('resetallkeys').setDescription('【管理员】一键解绑所有卡密的设备/IP').setDefaultMemberPermissions(PermissionFlagsBits.Administrator), // 🌟 新增全局重置指令
     new SlashCommandBuilder().setName('delkey').setDescription('【管理员】删除/作废卡密').addStringOption(o => o.setName('key').setDescription('卡密').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     new SlashCommandBuilder().setName('banuser').setDescription('【管理员】拉黑玩家').addStringOption(o => o.setName('username').setDescription('用户名').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     new SlashCommandBuilder().setName('unbanuser').setDescription('【管理员】解封玩家').addStringOption(o => o.setName('username').setDescription('用户名').setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
@@ -348,7 +375,9 @@ client.on('ready', async () => {
     try {
         await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
         console.log("Discord 指令加载完毕");
-    } catch (e) {}
+    } catch (e) {
+        console.error("加载 Discord 指令失败:", e);
+    }
 });
 
 client.on('interactionCreate', async interaction => {
@@ -377,6 +406,12 @@ client.on('interactionCreate', async interaction => {
         keyStore.set(k, { status: '', owner: '' });
         syncKeysToGithubAsync();
         return interaction.reply({ content: `✅ 卡密 \`${k}\` HWID 绑定已解绑`, ephemeral: true });
+    }
+
+    // 🌟 新增：处理 /resetallkeys 斜杠指令
+    if (commandName === 'resetallkeys') {
+        const count = resetAllKeyBindings();
+        return interaction.reply({ content: `🧹 **一键全局重置完成！** 共清除 **${count}** 张卡密的设备及 IP 绑定，卡密已全部恢复为未绑定状态。`, ephemeral: true });
     }
 
     if (commandName === 'delkey') {
